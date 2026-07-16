@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -615,9 +616,120 @@ def _load_gateway_config(path: str | Path) -> GatewayConfig:
 def _save_route_config(config: GatewayConfig, path: str | Path) -> None:
     if isinstance(path, str):
         path = Path(path)
-    path.write_text(
-        yaml.safe_dump(json.loads(json.dumps(config.model_dump(), default=pydantic_encoder)))
+    _atomic_write_text(
+        path,
+        yaml.safe_dump(json.loads(json.dumps(config.model_dump(), default=pydantic_encoder))),
     )
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically.
+
+    The gateway's config watcher (``mlflow.gateway.runner.monitor_config``) reloads
+    workers whenever the config file changes, so a partial write could momentarily
+    expose an invalid config. Writing to a temp file in the same directory and then
+    ``os.replace``-ing it makes the update a single atomic rename.
+
+    The temp file and replacement target use ``path`` as given (not its symlink
+    target) so the written path matches the path the gateway watches for reloads.
+    """
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def update_endpoint_model(
+    config_path: str | Path,
+    endpoint_name: str,
+    model_name: str,
+    *,
+    provider: str | None = None,
+    config: dict[str, Any] | None = None,
+) -> None:
+    """Swap the model served behind an existing gateway endpoint, in place.
+
+    Rewrites ``endpoint_name``'s model in the gateway configuration file while
+    leaving every other endpoint untouched. When the gateway is running via
+    ``mlflow gateway start``, its config watcher detects the change and reloads
+    workers, so subsequent requests to the same endpoint name are served by the
+    new model with no client change. This is the transparent model-swap primitive
+    used to promote an optimized model choice (see
+    :py:func:`mlflow.genai.optimize_prompts`) to a live endpoint.
+
+    Swapping to a different model of the **same provider** preserves the endpoint's
+    existing provider ``config`` (including API keys) and every other endpoint. Swapping
+    to a **different provider** requires new provider credentials, so ``config`` must be
+    supplied. API-key references (``$ENV_VAR`` or a file path) are written back verbatim
+    -- they are never resolved into literal secrets on disk.
+
+    Args:
+        config_path: Path to the gateway configuration YAML the server was started with.
+        endpoint_name: Name of the endpoint whose model should be swapped.
+        model_name: New model name to serve behind the endpoint.
+        provider: Optional new provider (e.g. ``"anthropic"``). Defaults to keeping
+            the endpoint's current provider.
+        config: Optional provider config dict (e.g. ``{"anthropic_api_key": "..."}``)
+            to replace the endpoint's current provider config. Required when
+            ``provider`` names a different provider than the endpoint currently uses.
+
+    Raises:
+        MlflowException: If the config file or the named endpoint does not exist, if
+            a provider change is requested without new ``config``, or if the
+            resulting configuration is invalid.
+    """
+    if not os.path.exists(config_path):
+        raise MlflowException.invalid_parameter_value(f"{config_path} does not exist")
+
+    # Read the RAW YAML rather than loading through `_load_gateway_config`. Loading
+    # runs provider validators that resolve API-key references (`$ENV_VAR` or a file
+    # path) into their literal secret values when the gateway's resolution flags are
+    # set -- which they are in a running server. Serializing that back would inline
+    # the secret into the config file on disk. Editing the raw mapping keeps every
+    # unrelated field (including unresolved key references) exactly as written.
+    try:
+        raw = yaml.safe_load(Path(config_path).read_text())
+    except Exception as e:
+        raise MlflowException.invalid_parameter_value(
+            f"The file at {config_path} is not a valid yaml file"
+        ) from e
+
+    endpoints = (raw or {}).get("endpoints") or []
+    match = next((e for e in endpoints if e.get("name") == endpoint_name), None)
+    if match is None:
+        available = [e.get("name") for e in endpoints]
+        raise MlflowException.invalid_parameter_value(
+            f"Endpoint {endpoint_name!r} not found in {config_path}. "
+            f"Available endpoints: {available}."
+        )
+
+    model = match["model"]
+    current_provider = model.get("provider")
+    if provider is not None and provider != current_provider and config is None:
+        raise MlflowException.invalid_parameter_value(
+            f"Changing endpoint {endpoint_name!r} from provider {current_provider!r} to "
+            f"{provider!r} requires new provider credentials. Pass `config=` with the "
+            f"{provider!r} provider settings (e.g. its API key)."
+        )
+
+    model["name"] = model_name
+    if provider is not None:
+        model["provider"] = provider
+    if config is not None:
+        model["config"] = config
+
+    # Re-validate a deep copy before persisting so a bad swap fails here rather
+    # than silently in the running server's reload. Validation may resolve secret
+    # references in memory; deep-copying guarantees that resolution can never reach
+    # the `raw` mapping we write back to disk, regardless of validator behavior.
+    try:
+        GatewayConfig(**copy.deepcopy(raw))
+    except ValidationError as e:
+        raise MlflowException.invalid_parameter_value(
+            f"Swapping endpoint {endpoint_name!r} to model {model_name!r} "
+            f"(provider {model.get('provider')!r}) produced an invalid configuration: {e}"
+        ) from e
+
+    _atomic_write_text(Path(config_path), yaml.safe_dump(raw))
 
 
 def _validate_config(config_path: str) -> GatewayConfig:

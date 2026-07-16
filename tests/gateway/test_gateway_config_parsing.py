@@ -12,6 +12,7 @@ from mlflow.gateway.config import (
     _load_gateway_config,
     _resolve_api_key_from_input,
     _save_route_config,
+    update_endpoint_model,
 )
 from mlflow.gateway.utils import assemble_uri_path
 
@@ -451,3 +452,164 @@ def test_litellm_config_removes_auth_mode():
     assert "auth_mode" not in config.litellm_auth_config
     assert config.litellm_auth_config["aws_region_name"] == "us-west-2"
     assert config.litellm_auth_config["api_key"] == "test-key"
+
+
+def test_update_endpoint_model_same_provider(basic_config_dict, tmp_path):
+    conf_path = tmp_path.joinpath("config.yaml")
+    conf_path.write_text(yaml.safe_dump(basic_config_dict))
+
+    update_endpoint_model(conf_path, "completions-gpt4", "gpt-4o")
+
+    reloaded = _load_gateway_config(conf_path)
+    swapped = next(e for e in reloaded.endpoints if e.name == "completions-gpt4")
+    # Model name is swapped, provider config (incl. API key) is preserved.
+    assert swapped.model.name == "gpt-4o"
+    assert swapped.model.provider == "openai"
+    assert swapped.model.config.openai_api_key == "mykey"
+    assert swapped.model.config.openai_organization == "my_company"
+    # Other endpoints are untouched.
+    others = {e.name: e.model.name for e in reloaded.endpoints if e.name != "completions-gpt4"}
+    assert others == {"chat-gpt4": "gpt-4", "claude-chat": "claude-v1"}
+
+
+def test_update_endpoint_model_leaves_no_temp_file(basic_config_dict, tmp_path):
+    conf_path = tmp_path.joinpath("config.yaml")
+    conf_path.write_text(yaml.safe_dump(basic_config_dict))
+
+    update_endpoint_model(conf_path, "chat-gpt4", "gpt-4o")
+
+    # The atomic write must not leave the temp file behind.
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+    assert leftovers == []
+
+
+def test_update_endpoint_model_unknown_endpoint_raises(basic_config_dict, tmp_path):
+    conf_path = tmp_path.joinpath("config.yaml")
+    conf_path.write_text(yaml.safe_dump(basic_config_dict))
+
+    with pytest.raises(MlflowException, match="not found"):
+        update_endpoint_model(conf_path, "does-not-exist", "gpt-4o")
+
+
+def test_update_endpoint_model_missing_config_raises(tmp_path):
+    with pytest.raises(MlflowException, match="does not exist"):
+        update_endpoint_model(tmp_path.joinpath("nope.yaml"), "any", "gpt-4o")
+
+
+def test_update_endpoint_model_provider_change_requires_config(basic_config_dict, tmp_path):
+    conf_path = tmp_path.joinpath("config.yaml")
+    conf_path.write_text(yaml.safe_dump(basic_config_dict))
+
+    with pytest.raises(MlflowException, match="requires new provider credentials"):
+        update_endpoint_model(conf_path, "chat-gpt4", "claude-v1", provider="anthropic")
+
+
+def test_update_endpoint_model_provider_change_with_config(basic_config_dict, tmp_path):
+    conf_path = tmp_path.joinpath("config.yaml")
+    conf_path.write_text(yaml.safe_dump(basic_config_dict))
+
+    update_endpoint_model(
+        conf_path,
+        "chat-gpt4",
+        "claude-3-5-sonnet-20241022",
+        provider="anthropic",
+        config={"anthropic_api_key": "ak-new"},
+    )
+
+    reloaded = _load_gateway_config(conf_path)
+    swapped = next(e for e in reloaded.endpoints if e.name == "chat-gpt4")
+    assert swapped.model.provider == "anthropic"
+    assert swapped.model.name == "claude-3-5-sonnet-20241022"
+    assert isinstance(swapped.model.config, AnthropicConfig)
+    assert swapped.model.config.anthropic_api_key == "ak-new"
+
+
+def test_update_endpoint_model_preserves_api_key_reference(tmp_path, monkeypatch):
+    # In a running gateway, key-resolution flags are enabled, so loading through
+    # the config parser resolves `$ENV_VAR` references into literal secrets. The
+    # swap must NOT write the resolved secret back to disk.
+    monkeypatch.setenv("MLFLOW_GATEWAY_RESOLVE_API_KEY_FROM_ENV", "true")
+    monkeypatch.setenv("MLFLOW_GATEWAY_RESOLVE_API_KEY_FROM_FILE", "true")
+    monkeypatch.setenv("MY_OPENAI_KEY", "sk-the-real-secret")
+    conf_path = tmp_path.joinpath("config.yaml")
+    conf_path.write_text(
+        yaml.safe_dump({
+            "endpoints": [
+                {
+                    "name": "chat",
+                    "endpoint_type": "llm/v1/chat",
+                    "model": {
+                        "name": "gpt-4o-mini",
+                        "provider": "openai",
+                        "config": {"openai_api_key": "$MY_OPENAI_KEY"},
+                    },
+                }
+            ]
+        })
+    )
+
+    update_endpoint_model(conf_path, "chat", "gpt-4o")
+
+    on_disk = yaml.safe_load(conf_path.read_text())
+    key = on_disk["endpoints"][0]["model"]["config"]["openai_api_key"]
+    assert key == "$MY_OPENAI_KEY", "swap leaked the resolved secret into the config file"
+    assert on_disk["endpoints"][0]["model"]["name"] == "gpt-4o"
+
+
+def test_update_endpoint_model_writes_the_given_path(basic_config_dict, tmp_path):
+    # The swap must write the exact path it was given -- that is the path the
+    # gateway's config watcher monitors for reloads. (For a symlinked config, the
+    # atomic replace lands on that path so the watcher still fires.)
+    conf_path = tmp_path.joinpath("config.yaml")
+    conf_path.write_text(yaml.safe_dump(basic_config_dict))
+
+    update_endpoint_model(conf_path, "chat-gpt4", "gpt-4o")
+
+    on_disk = yaml.safe_load(conf_path.read_text())
+    swapped = next(e for e in on_disk["endpoints"] if e["name"] == "chat-gpt4")
+    assert swapped["model"]["name"] == "gpt-4o"
+
+
+def test_update_endpoint_model_preserves_traffic_routes(tmp_path):
+    conf_path = tmp_path.joinpath("config.yaml")
+    conf_path.write_text(
+        yaml.safe_dump({
+            "endpoints": [
+                {
+                    "name": "chat-a",
+                    "endpoint_type": "llm/v1/chat",
+                    "model": {
+                        "name": "gpt-4o-mini",
+                        "provider": "openai",
+                        "config": {"openai_api_key": "k"},
+                    },
+                },
+                {
+                    "name": "chat-b",
+                    "endpoint_type": "llm/v1/chat",
+                    "model": {
+                        "name": "gpt-4o",
+                        "provider": "openai",
+                        "config": {"openai_api_key": "k"},
+                    },
+                },
+            ],
+            "routes": [
+                {
+                    "name": "split",
+                    "task_type": "llm/v1/chat",
+                    "destinations": [
+                        {"name": "chat-a", "traffic_percentage": 50},
+                        {"name": "chat-b", "traffic_percentage": 50},
+                    ],
+                }
+            ],
+        })
+    )
+
+    update_endpoint_model(conf_path, "chat-a", "gpt-4o")
+
+    reloaded = _load_gateway_config(conf_path)
+    assert reloaded.routes is not None
+    assert reloaded.routes[0].name == "split"
+    assert [d.name for d in reloaded.routes[0].destinations] == ["chat-a", "chat-b"]

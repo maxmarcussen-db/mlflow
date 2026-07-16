@@ -32,10 +32,12 @@ from mlflow.gateway.config import (
     EndpointType,
     GatewayConfig,
     LimitsConfig,
+    Model,
     Provider,
     TrafficRouteConfig,
     _LegacyRoute,
     _load_gateway_config,
+    update_endpoint_model,
 )
 from mlflow.gateway.constants import (
     MLFLOW_GATEWAY_CRUD_ENDPOINT_V3_BASE,
@@ -45,6 +47,7 @@ from mlflow.gateway.constants import (
     MLFLOW_GATEWAY_LIMITS_BASE,
     MLFLOW_GATEWAY_ROUTE_BASE,
     MLFLOW_GATEWAY_SEARCH_ROUTES_PAGE_SIZE,
+    MLFLOW_GATEWAY_UPDATE_ENDPOINT_MODEL_V3_BASE,
     MLFLOW_QUERY_SUFFIX,
 )
 from mlflow.gateway.providers import get_provider
@@ -189,6 +192,21 @@ def _get_endpoint_handler(gateway_api: GatewayAPI, name: str, limiter: Limiter, 
 
 class HealthResponse(BaseModel):
     status: str
+
+
+class UpdateEndpointModelRequest(BaseModel):
+    """Request body for swapping the model behind an endpoint at runtime.
+
+    Only the model name is swapped; the endpoint keeps its provider and provider
+    config (credentials). Changing the provider requires editing the config file
+    (see :py:func:`mlflow.gateway.update_endpoint_model`) and restarting, because
+    the running route's provider handler is bound at startup.
+    """
+
+    model_name: str
+
+    # `model_name` starts with the protected `model_` prefix; opt out of the warning.
+    model_config = ConfigDict(protected_namespaces=())
 
 
 class ListEndpointsResponse(BaseModel):
@@ -351,6 +369,53 @@ def create_app_from_config(config: GatewayConfig) -> GatewayAPI:
             detail=f"The endpoint '{endpoint_name}' is not present or active on the server. "
             f"Please verify the endpoint name.",
         )
+
+    @app.post(
+        MLFLOW_GATEWAY_UPDATE_ENDPOINT_MODEL_V3_BASE + "{endpoint_name}", include_in_schema=False
+    )
+    async def update_endpoint_model_v3(
+        endpoint_name: str, payload: UpdateEndpointModelRequest
+    ) -> Endpoint:
+        """Swap the model behind ``endpoint_name`` at runtime (same provider).
+
+        Updates this worker's in-memory endpoint config -- taking effect on the
+        next request without a restart, since the served model name is read from
+        the endpoint config per request -- and persists the change to the gateway
+        config file so restarted or sibling workers converge on the same model.
+
+        Note: for Azure OpenAI endpoints, upstream routing is by
+        ``openai_deployment_name`` (in the provider config), not the model name,
+        so a model-name swap alone does not redirect Azure traffic. Change the
+        deployment name via the config file for those endpoints.
+        """
+        existing = app.dynamic_endpoints.get(endpoint_name)
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"The endpoint '{endpoint_name}' is not present or active on the server. "
+                f"Please verify the endpoint name.",
+            )
+
+        # Persist first so the change survives restarts and reaches other workers;
+        # update_endpoint_model validates the swap and raises on bad input.
+        config_path = MLFLOW_GATEWAY_CONFIG.get()
+        if config_path:
+            try:
+                update_endpoint_model(config_path, endpoint_name, payload.model_name)
+            except MlflowException as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+
+        # Update this worker's live config object so the swap takes effect on the
+        # next request. The route's provider handler holds a reference to this same
+        # config object and reads model.name per request, so only the name changes;
+        # the provider and its credentials are preserved.
+        existing.model = Model(
+            name=payload.model_name,
+            provider=existing.model.provider,
+            config=existing.model.config,
+        )
+
+        return existing.to_endpoint()
 
     @app.get(MLFLOW_GATEWAY_CRUD_ROUTE_V3_BASE + "{route_name}", include_in_schema=False)
     async def get_route_v3(route_name: str) -> TrafficRouteConfig:

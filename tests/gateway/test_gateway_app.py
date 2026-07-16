@@ -11,6 +11,7 @@ from mlflow.gateway.constants import (
     MLFLOW_GATEWAY_CRUD_ROUTE_BASE,
     MLFLOW_GATEWAY_CRUD_ROUTE_V3_BASE,
     MLFLOW_GATEWAY_ROUTE_BASE,
+    MLFLOW_GATEWAY_UPDATE_ENDPOINT_MODEL_V3_BASE,
 )
 
 from tests.gateway.tools import MockAsyncResponse
@@ -162,6 +163,83 @@ def test_get_endpoint_v3(client: TestClient):
         "endpoint_url": "/gateway/chat-gpt4/invocations",
         "limit": None,
     }
+
+
+def test_update_endpoint_model_v3_swaps_live_and_persists(tmp_path, monkeypatch):
+    import yaml
+
+    from mlflow.gateway.app import create_app_from_path
+
+    config_path = tmp_path.joinpath("gateway.yaml")
+    config_path.write_text(
+        yaml.safe_dump({
+            "endpoints": [
+                {
+                    "name": "chat",
+                    "endpoint_type": "llm/v1/chat",
+                    "model": {
+                        "name": "gpt-4o-mini",
+                        "provider": "openai",
+                        "config": {"openai_api_key": "sk-x"},
+                    },
+                }
+            ]
+        })
+    )
+    monkeypatch.setenv("MLFLOW_GATEWAY_CONFIG", str(config_path))
+    app = create_app_from_path(config_path)
+    client = TestClient(app)
+
+    def served_upstream_model():
+        # Capture the model the provider actually asks the upstream for.
+        captured = {}
+
+        def fake_post(self, url, *args, **kwargs):
+            captured["model"] = (kwargs.get("json") or {}).get("model")
+            return MockAsyncResponse({
+                "id": "x",
+                "object": "chat.completion",
+                "created": 1,
+                "model": captured["model"],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "hi"},
+                        "finish_reason": "stop",
+                        "index": 0,
+                    }
+                ],
+            })
+
+        with mock.patch("aiohttp.ClientSession.post", new=fake_post):
+            client.post(
+                f"{MLFLOW_GATEWAY_ROUTE_BASE}chat/invocations",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+            )
+        return captured["model"]
+
+    assert served_upstream_model() == "gpt-4o-mini"
+
+    resp = client.post(
+        f"{MLFLOW_GATEWAY_UPDATE_ENDPOINT_MODEL_V3_BASE}chat",
+        json={"model_name": "gpt-4o"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["model"] == {"name": "gpt-4o", "provider": "openai"}
+
+    # Live effect on this worker (no restart), and persisted to the config file.
+    assert served_upstream_model() == "gpt-4o"
+    on_disk = yaml.safe_load(config_path.read_text())
+    assert on_disk["endpoints"][0]["model"]["name"] == "gpt-4o"
+    assert on_disk["endpoints"][0]["model"]["config"]["openai_api_key"] == "sk-x"
+
+
+def test_update_endpoint_model_v3_unknown_endpoint(client: TestClient):
+    resp = client.post(
+        f"{MLFLOW_GATEWAY_UPDATE_ENDPOINT_MODEL_V3_BASE}does-not-exist",
+        json={"model_name": "gpt-4o"},
+    )
+    assert resp.status_code == 404
 
 
 def test_get_route_v3(client: TestClient):
