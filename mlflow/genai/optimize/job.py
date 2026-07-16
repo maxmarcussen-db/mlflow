@@ -129,6 +129,7 @@ def _create_optimizer(
             reflection_model=reflection_model,
             max_metric_calls=config.get("max_metric_calls", 100),
             display_progress_bar=config.get("display_progress_bar", False),
+            model_candidates=config.get("model_candidates"),
             gepa_kwargs=config.get("gepa_kwargs"),
         )
     elif optimizer_type_lower == OptimizerType.METAPROMPT:

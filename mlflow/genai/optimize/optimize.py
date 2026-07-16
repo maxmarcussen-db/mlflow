@@ -2,6 +2,7 @@ import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import copy_context
 from typing import TYPE_CHECKING, Any, Callable
 
 import mlflow
@@ -245,6 +246,7 @@ def optimize_prompts(
     return PromptOptimizationResult(
         optimized_prompts=optimized_prompts,
         optimizer_name=optimizer.__class__.__name__,
+        optimized_models=optimizer_output.optimized_models,
         initial_eval_score=optimizer_output.initial_eval_score,
         final_eval_score=optimizer_output.final_eval_score,
         initial_eval_score_per_scorer=optimizer_output.initial_eval_score_per_scorer,
@@ -332,7 +334,13 @@ def _build_eval_fn(
                 ) as executor,
                 configure_autologging_for_evaluation(enable_tracing=True),
             ):
-                futures = [executor.submit(_run_single, record) for record in dataset]
+                # Copy the current context into each worker thread so context-local
+                # state set by the optimizer (e.g. the model selection consumed by
+                # mlflow.genai.optimize.get_optimized_model) is visible inside
+                # predict_fn, which runs off the calling thread.
+                futures = [
+                    executor.submit(copy_context().run, _run_single, record) for record in dataset
+                ]
                 results = [future.result() for future in futures]
 
             # Check for unused prompts and warn

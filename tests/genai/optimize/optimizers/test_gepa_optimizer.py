@@ -659,3 +659,321 @@ def test_extract_eval_scores_per_scorer(val_aggregate_scores, val_aggregate_subs
 
     result = optimizer._extract_eval_scores(mock_result)
     assert result == expected
+
+
+# ---------------------------------------------------------------------------
+# Joint model + prompt optimization (model_candidates)
+# ---------------------------------------------------------------------------
+
+
+def _fake_gepa_module(drive_fn):
+    """Build a fake ``gepa`` module whose ``optimize`` runs ``drive_fn(adapter, kwargs)``.
+
+    Unlike a bare MagicMock, this lets tests exercise the adapter the way real
+    GEPA would (calling ``adapter.evaluate`` with candidates), so behavior such
+    as model-selection delivery and invalid-model rejection is covered.
+    """
+
+    class FakeEvaluationBatch:
+        def __init__(self, outputs, scores, trajectories=None, objective_scores=None):
+            self.outputs = outputs
+            self.scores = scores
+            self.trajectories = trajectories
+            self.objective_scores = objective_scores
+
+    mock_gepa = MagicMock()
+    mock_gepa.EvaluationBatch = FakeEvaluationBatch
+    mock_gepa.GEPAAdapter = object
+
+    def optimize(**kwargs):
+        result = drive_fn(kwargs["adapter"], kwargs)
+        mock_gepa.optimize.last_kwargs = kwargs
+        return result
+
+    mock_gepa.optimize.side_effect = optimize
+    return mock_gepa, {
+        "gepa": mock_gepa,
+        "gepa.core": MagicMock(),
+        "gepa.core.adapter": MagicMock(),
+    }
+
+
+def test_model_candidates_validation():
+    from mlflow.exceptions import MlflowException
+
+    # Valid: dedups while preserving order.
+    optimizer = GepaPromptOptimizer(
+        reflection_model="openai:/gpt-4o",
+        model_candidates={"gen": ["openai:/gpt-4o", "openai:/gpt-4o-mini", "openai:/gpt-4o"]},
+    )
+    assert optimizer.model_candidates == {"gen": ["openai:/gpt-4o", "openai:/gpt-4o-mini"]}
+
+    # None / empty -> no model optimization (backward compatible).
+    assert GepaPromptOptimizer(reflection_model="openai:/gpt-4o").model_candidates == {}
+    assert (
+        GepaPromptOptimizer(reflection_model="openai:/gpt-4o", model_candidates={}).model_candidates
+        == {}
+    )
+
+    # Invalid shapes.
+    for bad in [{"": ["a"]}, {"gen": []}, {"gen": "not-a-list"}]:
+        with pytest.raises(MlflowException, match="model_candidates"):
+            GepaPromptOptimizer(reflection_model="openai:/gpt-4o", model_candidates=bad)
+
+
+def test_optimize_with_model_candidates_seeds_and_splits(
+    sample_train_data: list[dict[str, Any]],
+    sample_target_prompts: dict[str, str],
+    mock_eval_fn: Any,
+):
+    from mlflow.genai.optimize.optimizers.gepa_optimizer import _model_component_name
+
+    def drive(adapter, kwargs):
+        # Emulate GEPA selecting a different model for the "gen" slot.
+        best = dict(kwargs["seed_candidate"])
+        best[_model_component_name("gen")] = "openai:/gpt-4o"
+        result = Mock()
+        result.best_candidate = best
+        result.val_aggregate_scores = [0.5, 0.9]
+        result.val_aggregate_subscores = [{"accuracy": 0.5}, {"accuracy": 0.9}]
+        return result
+
+    mock_gepa, mock_modules = _fake_gepa_module(drive)
+    optimizer = GepaPromptOptimizer(
+        reflection_model="openai:/gpt-4o",
+        model_candidates={"gen": ["openai:/gpt-4o-mini", "openai:/gpt-4o"]},
+    )
+
+    with patch.dict(sys.modules, mock_modules):
+        result = optimizer.optimize(
+            eval_fn=mock_eval_fn,
+            train_data=sample_train_data,
+            target_prompts=sample_target_prompts,
+        )
+
+    kwargs = mock_gepa.optimize.last_kwargs
+    # Seed carries the prompts plus the first candidate model.
+    assert kwargs["seed_candidate"][_model_component_name("gen")] == "openai:/gpt-4o-mini"
+    assert kwargs["seed_candidate"]["system_prompt"] == sample_target_prompts["system_prompt"]
+    # Model slot got a discrete-choice reflection template; prompts use the default (absent).
+    reflection = kwargs["reflection_prompt_template"]
+    assert set(reflection.keys()) == {_model_component_name("gen")}
+    assert "<curr_param>" in reflection[_model_component_name("gen")]
+    # Result is split back into prompts vs. models.
+    assert "__model__:gen" not in result.optimized_prompts
+    assert result.optimized_models == {"gen": "openai:/gpt-4o"}
+
+
+def test_optimize_delivers_model_selection_to_eval_fn(
+    sample_train_data: list[dict[str, Any]],
+    sample_target_prompts: dict[str, str],
+):
+    from mlflow.genai.optimize import get_optimized_model
+    from mlflow.genai.optimize.optimizers.gepa_optimizer import _model_component_name
+
+    seen_models = []
+
+    def recording_eval_fn(candidate_prompts, dataset):
+        # candidate_prompts must NOT contain the model component.
+        assert all(not k.startswith("__model__:") for k in candidate_prompts)
+        seen_models.append(get_optimized_model("gen", default="DEFAULT"))
+        return [
+            EvaluationResultRecord(
+                inputs=r["inputs"],
+                outputs="o",
+                expectations=r["outputs"],
+                score=1.0,
+                trace={},
+                rationales={},
+                individual_scores={"accuracy": 1.0},
+            )
+            for r in dataset
+        ]
+
+    def drive(adapter, kwargs):
+        seed = kwargs["seed_candidate"]
+        adapter.evaluate(kwargs["trainset"], seed, capture_traces=False)
+        switched = dict(seed)
+        switched[_model_component_name("gen")] = "openai:/gpt-4o"
+        adapter.evaluate(kwargs["trainset"], switched, capture_traces=False)
+        result = Mock()
+        result.best_candidate = switched
+        result.val_aggregate_scores = [1.0, 1.0]
+        result.val_aggregate_subscores = None
+        return result
+
+    _, mock_modules = _fake_gepa_module(drive)
+    optimizer = GepaPromptOptimizer(
+        reflection_model="openai:/gpt-4o",
+        model_candidates={"gen": ["openai:/gpt-4o-mini", "openai:/gpt-4o"]},
+    )
+
+    with patch.dict(sys.modules, mock_modules):
+        optimizer.optimize(
+            eval_fn=recording_eval_fn,
+            train_data=sample_train_data,
+            target_prompts=sample_target_prompts,
+            enable_tracking=False,
+        )
+
+    # eval_fn saw the seed model then the switched one - never the DEFAULT, proving the
+    # ContextVar-based selection reaches the eval function.
+    assert seen_models == ["openai:/gpt-4o-mini", "openai:/gpt-4o"]
+
+
+def test_optimize_rejects_out_of_list_model(
+    sample_train_data: list[dict[str, Any]],
+    sample_target_prompts: dict[str, str],
+):
+    from mlflow.genai.optimize.optimizers.gepa_optimizer import _model_component_name
+
+    eval_calls = []
+
+    def counting_eval_fn(candidate_prompts, dataset):
+        eval_calls.append(candidate_prompts)
+        return [
+            EvaluationResultRecord(
+                inputs=r["inputs"],
+                outputs="o",
+                expectations=r["outputs"],
+                score=1.0,
+                trace={},
+                rationales={},
+                individual_scores={},
+            )
+            for r in dataset
+        ]
+
+    captured = {}
+
+    def drive(adapter, kwargs):
+        # A hallucinated model (not in the candidate list) must be rejected without
+        # ever invoking the eval function.
+        bad = dict(kwargs["seed_candidate"])
+        bad[_model_component_name("gen")] = "openai:/hallucinated-model"
+        batch = kwargs["trainset"]
+        captured["rejected"] = adapter.evaluate(batch, bad, capture_traces=False)
+        result = Mock()
+        result.best_candidate = kwargs["seed_candidate"]
+        result.val_aggregate_scores = []
+        result.val_aggregate_subscores = None
+        return result
+
+    _, mock_modules = _fake_gepa_module(drive)
+    optimizer = GepaPromptOptimizer(
+        reflection_model="openai:/gpt-4o",
+        model_candidates={"gen": ["openai:/gpt-4o-mini", "openai:/gpt-4o"]},
+    )
+
+    with patch.dict(sys.modules, mock_modules):
+        optimizer.optimize(
+            eval_fn=counting_eval_fn,
+            train_data=sample_train_data,
+            target_prompts=sample_target_prompts,
+            enable_tracking=False,
+        )
+
+    assert captured["rejected"].scores == [0.0] * len(sample_train_data)
+    # eval_fn was never called for the invalid candidate.
+    assert eval_calls == []
+
+
+def test_optimize_merges_dict_reflection_template_with_model_candidates(
+    sample_train_data: list[dict[str, Any]],
+    sample_target_prompts: dict[str, str],
+    mock_eval_fn: Any,
+):
+    from mlflow.genai.optimize.optimizers.gepa_optimizer import _model_component_name
+
+    def drive(adapter, kwargs):
+        result = Mock()
+        result.best_candidate = kwargs["seed_candidate"]
+        result.val_aggregate_scores = []
+        result.val_aggregate_subscores = None
+        return result
+
+    mock_gepa, mock_modules = _fake_gepa_module(drive)
+    optimizer = GepaPromptOptimizer(
+        reflection_model="openai:/gpt-4o",
+        model_candidates={"gen": ["openai:/gpt-4o-mini", "openai:/gpt-4o"]},
+        gepa_kwargs={"reflection_prompt_template": {"system_prompt": "custom <curr_param>"}},
+    )
+
+    with patch.dict(sys.modules, mock_modules):
+        optimizer.optimize(
+            eval_fn=mock_eval_fn,
+            train_data=sample_train_data,
+            target_prompts=sample_target_prompts,
+            enable_tracking=False,
+        )
+
+    templates = mock_gepa.optimize.last_kwargs["reflection_prompt_template"]
+    # Caller's prompt template is preserved and the model slot template is added.
+    assert templates["system_prompt"] == "custom <curr_param>"
+    assert _model_component_name("gen") in templates
+
+
+def test_optimize_rejects_string_reflection_template_with_model_candidates(
+    sample_train_data: list[dict[str, Any]],
+    sample_target_prompts: dict[str, str],
+    mock_eval_fn: Any,
+):
+    from mlflow.exceptions import MlflowException
+
+    _, mock_modules = _fake_gepa_module(lambda adapter, kwargs: Mock())
+    optimizer = GepaPromptOptimizer(
+        reflection_model="openai:/gpt-4o",
+        model_candidates={"gen": ["openai:/gpt-4o-mini", "openai:/gpt-4o"]},
+        gepa_kwargs={"reflection_prompt_template": "single <curr_param> <side_info>"},
+    )
+
+    with patch.dict(sys.modules, mock_modules):
+        with pytest.raises(MlflowException, match="must be a dict"):
+            optimizer.optimize(
+                eval_fn=mock_eval_fn,
+                train_data=sample_train_data,
+                target_prompts=sample_target_prompts,
+                enable_tracking=False,
+            )
+
+
+def test_optimize_rejects_prompt_name_colliding_with_model_prefix(
+    sample_train_data: list[dict[str, Any]],
+    mock_eval_fn: Any,
+):
+    from mlflow.exceptions import MlflowException
+    from mlflow.genai.optimize.optimizers.gepa_optimizer import _model_component_name
+
+    _, mock_modules = _fake_gepa_module(lambda adapter, kwargs: Mock())
+    optimizer = GepaPromptOptimizer(
+        reflection_model="openai:/gpt-4o",
+        model_candidates={"gen": ["openai:/gpt-4o-mini", "openai:/gpt-4o"]},
+    )
+    colliding_prompts = {_model_component_name("gen"): "some template"}
+
+    with patch.dict(sys.modules, mock_modules):
+        with pytest.raises(MlflowException, match="reserved for model components"):
+            optimizer.optimize(
+                eval_fn=mock_eval_fn,
+                train_data=sample_train_data,
+                target_prompts=colliding_prompts,
+                enable_tracking=False,
+            )
+
+
+def test_model_candidates_rejects_non_string_and_reserved_slots():
+    from mlflow.exceptions import MlflowException
+
+    with pytest.raises(MlflowException, match="non-empty model name strings"):
+        GepaPromptOptimizer(reflection_model="openai:/gpt-4o", model_candidates={"gen": ["ok", 5]})
+
+    with pytest.raises(MlflowException, match="reserved for internal use"):
+        GepaPromptOptimizer(
+            reflection_model="openai:/gpt-4o", model_candidates={"__model__:x": ["a"]}
+        )
+
+
+def test_get_optimized_model_default_outside_optimization():
+    from mlflow.genai.optimize import get_optimized_model
+
+    assert get_optimized_model("anything", default="openai:/gpt-4o-mini") == "openai:/gpt-4o-mini"

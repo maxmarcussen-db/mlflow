@@ -120,6 +120,9 @@ class PromptOptimizerOutput:
         final_eval_score: The evaluation score after optimization (optional).
         initial_eval_score_per_scorer: Per-scorer scores before optimization (scorer name -> score).
         final_eval_score_per_scorer: Per-scorer scores after optimization (scorer name -> score).
+        optimized_models: The selected model for each optimized model slot
+            (model slot name -> model name). Empty when the optimizer did not
+            optimize any model choices. e.g., {"generator": "openai:/gpt-4o"}
     """
 
     optimized_prompts: dict[str, str]
@@ -127,6 +130,7 @@ class PromptOptimizerOutput:
     final_eval_score: float | None = None
     initial_eval_score_per_scorer: dict[str, float] = field(default_factory=dict)
     final_eval_score_per_scorer: dict[str, float] = field(default_factory=dict)
+    optimized_models: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -141,6 +145,9 @@ class PromptOptimizationResult:
         final_eval_score: The evaluation score after optimization (optional).
         initial_eval_score_per_scorer: Per-scorer scores before optimization (scorer name -> score).
         final_eval_score_per_scorer: Per-scorer scores after optimization (scorer name -> score).
+        optimized_models: The selected model for each optimized model slot
+            (model slot name -> model name). Empty when no model choices were
+            optimized. e.g., {"generator": "openai:/gpt-4o"}
     """
 
     optimized_prompts: list[PromptVersion]
@@ -149,3 +156,4 @@ class PromptOptimizationResult:
     final_eval_score: float | None = None
     initial_eval_score_per_scorer: dict[str, float] = field(default_factory=dict)
     final_eval_score_per_scorer: dict[str, float] = field(default_factory=dict)
+    optimized_models: dict[str, str] = field(default_factory=dict)
