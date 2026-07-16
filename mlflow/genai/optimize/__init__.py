@@ -1,4 +1,5 @@
 from mlflow.exceptions import MlflowException
+from mlflow.genai.optimize.gateway_databricks import update_databricks_endpoint_model
 from mlflow.genai.optimize.model_selection import get_optimized_model
 from mlflow.genai.optimize.optimize import optimize_prompts
 from mlflow.genai.optimize.optimizers import (
@@ -97,6 +98,7 @@ __all__ = [
     "optimize_prompts",
     "optimize_prompt",
     "get_optimized_model",
+    "update_databricks_endpoint_model",
     "LLMParams",
     "OptimizerConfig",
     "BasePromptOptimizer",
